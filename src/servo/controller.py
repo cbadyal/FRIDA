@@ -125,9 +125,13 @@ class ServoController:
         driver: Optional[PCA9685] = None,
         servos: Mapping[int, ServoConfig] = SERVOS,
         wait_fn: Optional[Callable[[float], bool]] = None,
+        motion_profile: str = "smoothstep",
     ):
+        if motion_profile not in ("smoothstep", "smootherstep"):
+            raise ValueError(f"Unknown motion profile: {motion_profile}")
         self.driver = driver or PCA9685()
         self.servos = dict(servos)
+        self.motion_profile = motion_profile
         self.current_angles = {
             channel: config.rest_deg for channel, config in self.servos.items()
         }
@@ -189,10 +193,12 @@ class ServoController:
                 channel: self.current_angles[channel] for channel in safe_targets
             }
 
-            # Smoothstep's peak velocity is 1.5 times its average velocity.
+            smoother = self.motion_profile == "smootherstep"
+            # Peak velocity factors for cubic and zero-end-acceleration quintic easing.
+            peak_velocity_factor = 1.875 if smoother else 1.5
             minimum_duration = max(
                 [
-                    1.5
+                    peak_velocity_factor
                     * abs(safe_targets[channel] - starts[channel])
                     / self.servos[channel].max_speed_dps
                     for channel in safe_targets
@@ -206,16 +212,28 @@ class ServoController:
             duration = max(0.0, duration)
             steps = max(1, math.ceil(duration * UPDATE_HZ))
             interval = duration / steps
+            next_update = time.monotonic() + interval if smoother else 0.0
 
             for step in range(1, steps + 1):
                 if self.cancelled:
                     return False
+                if smoother and interval:
+                    delay = max(0.0, next_update - time.monotonic())
+                    if delay and self._wait_fn(delay):
+                        return False
+                    if self.cancelled:
+                        return False
+                    # Account for write time without bursting after a late frame.
+                    next_update = time.monotonic() + interval
                 progress = step / steps
-                eased = progress * progress * (3.0 - 2.0 * progress)
+                if smoother:
+                    eased = progress**3 * (10.0 + progress * (-15.0 + 6.0 * progress))
+                else:
+                    eased = progress * progress * (3.0 - 2.0 * progress)
                 for channel, target in safe_targets.items():
                     angle = starts[channel] + (target - starts[channel]) * eased
                     self._write_angle(channel, angle)
-                if step < steps and interval and self._wait_fn(interval):
+                if not smoother and step < steps and interval and self._wait_fn(interval):
                     return False
 
             return True
