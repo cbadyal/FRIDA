@@ -1,65 +1,88 @@
+"""Camera-only face detection for FRIDA's Raspberry Pi Camera Module."""
+
+from pathlib import Path
+
 import cv2
+from libcamera import controls
+from picamera2 import Picamera2
 
-# ========================
-# Face Center Detection
-# ========================
-# (Sections marked with '# CHANGED' are new or modified)
 
-def main():
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)    # RESEARCH HOW TO KEEP SCALING ON WEBCAM BUT SMALLER PICTURE
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+def load_face_cascade():
+    filename = 'haarcascade_frontalface_default.xml'
+    directories = [
+        Path('/usr/share/opencv4/haarcascades'),
+        Path('/usr/share/opencv/haarcascades'),
+    ]
+    opencv_data = getattr(cv2, 'data', None)
+    if opencv_data is not None:
+        directories.insert(0, Path(opencv_data.haarcascades))
+
+    for directory in directories:
+        path = directory / filename
+        if path.is_file():
+            cascade = cv2.CascadeClassifier(str(path))
+            if not cascade.empty():
+                return cascade
+
+    raise RuntimeError(
+        'Could not load the face detection model. '
+        'On Raspberry Pi OS, install it with: sudo apt install opencv-data'
     )
 
-    print("Press 'q' to quit.")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.3, minNeighbors=5, minSize=(30, 30)
+def main():
+    face_cascade = load_face_cascade()
+    camera = Picamera2()
+    try:
+        # Picamera2's RGB888 format supplies the BGR ordering OpenCV expects.
+        config = camera.create_preview_configuration(
+            main={'format': 'RGB888', 'size': (320, 240)},
+            controls={'FrameRate': 30},
         )
+        camera.configure(config)
+        if 'AfMode' in camera.camera_controls:
+            camera.set_controls({'AfMode': controls.AfModeEnum.Continuous})
+        camera.start()
 
-        for (x, y, w, h) in faces:
-            # draw the face rectangle
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        print("Press 'q' in the camera window or Ctrl+C in the terminal to quit.")
+        while True:
+            frame = camera.capture_array('main')
 
-            # === CHANGED ===
-            # compute the center point of the face
-            cx = x + w // 2
-            cy = y + h // 2
-
-            # === CHANGED ===
-            # draw a small circle at the center of the face
-            cv2.circle(frame, (cx, cy), 4, (255, 0, 0), -1)
-
-            # === CHANGED ===
-            # overlay the center coordinates next to the face
-            cv2.putText(
-                frame,
-                f"({cx},{cy})",
-                (cx + 10, cy - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 0, 0),
-                1,
-                cv2.LINE_AA
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.3, minNeighbors=5, minSize=(30, 30)
             )
 
-            # === CHANGED ===
-            # also print to console
-            print(f"Face center at x={cx}, y={cy}")
+            for (x, y, w, h) in faces:
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        cv2.imshow('Face Centers - 320x240', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+                cx = x + w // 2
+                cy = y + h // 2
 
-    cap.release()
-    cv2.destroyAllWindows()
+                cv2.circle(frame, (cx, cy), 4, (255, 0, 0), -1)
+
+                cv2.putText(
+                    frame,
+                    f"({cx},{cy})",
+                    (cx + 10, cy - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 0, 0),
+                    1,
+                    cv2.LINE_AA
+                )
+
+                print(f"Face center at x={cx}, y={cy}")
+
+            cv2.imshow('Face Centers - 320x240', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        camera.close()
+        cv2.destroyAllWindows()
+
 
 if __name__ == '__main__':
     main()
