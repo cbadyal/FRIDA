@@ -71,7 +71,14 @@ class PCA9685:
                 raise RuntimeError(f"Cannot open I2C bus {I2C_BUS}: {exc}") from exc
 
         self.bus = bus
-        self._initialize()
+        try:
+            self._initialize()
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                LOGGER.exception("Could not finish PCA9685 cleanup after initialization failed")
+            raise
 
     def _initialize(self) -> None:
         with self._lock:
@@ -111,10 +118,12 @@ class PCA9685:
         with self._lock:
             if self._closed:
                 return
-            if disable:
-                self.disable_all()
-            self.bus.close()
-            self._closed = True
+            try:
+                if disable:
+                    self.disable_all()
+            finally:
+                self._closed = True
+                self.bus.close()
 
 
 class ServoController:
@@ -138,6 +147,9 @@ class ServoController:
         self._movement_lock = threading.RLock()
         self._cancelled = threading.Event()
         self._wait_fn = wait_fn or self._cancelled.wait
+        self._targets = {}
+        self._velocities = {}
+        self._commanded_channels = set()
 
     @property
     def cancelled(self) -> bool:
@@ -152,6 +164,8 @@ class ServoController:
     def _safe_target(self, channel: int, target: float) -> float:
         if channel not in self.servos:
             raise ValueError(f"No servo configuration for channel {channel}")
+        if not math.isfinite(target):
+            raise ValueError("Servo targets must be finite")
         config = self.servos[channel]
         safe_target = clamp_angle(config, target)
         if not math.isclose(safe_target, float(target)):
@@ -168,6 +182,69 @@ class ServoController:
         safe_angle = clamp_angle(config, angle)
         self.driver.set_pulse_us(channel, angle_to_pulse_us(config, safe_angle))
         self.current_angles[channel] = safe_angle
+        self._commanded_channels.add(channel)
+
+    def set_target(self, channel: int, target: float) -> bool:
+        """Replace a scheduled target without waiting or writing to hardware.
+
+        Call update() from one motion loop. This API lets tracking replace stale
+        head targets while another channel performs a gesture. Existing scripts
+        can continue using the blocking move_smooth()/move_many() API instead.
+        """
+        with self._movement_lock:
+            if self.cancelled:
+                return False
+            target = self._safe_target(channel, target)
+            if (
+                channel not in self._targets
+                and channel in self._commanded_channels
+                and math.isclose(self.current_angles[channel], target)
+            ):
+                return True
+            self._targets[channel] = target
+            return True
+
+    def is_moving(self, channel: int) -> bool:
+        with self._movement_lock:
+            return channel in self._targets and not self.cancelled
+
+    def update(self, elapsed: float = 1.0 / UPDATE_HZ) -> bool:
+        """Advance scheduled channels with limited speed and acceleration.
+
+        A late update advances at most one normal tick, avoiding a sudden jump
+        after a stall. Untargeted channels receive no PWM commands.
+        """
+        if not math.isfinite(elapsed) or elapsed <= 0:
+            raise ValueError("Update elapsed time must be finite and positive")
+        dt = min(elapsed, 1.0 / UPDATE_HZ)
+        with self._movement_lock:
+            if self.cancelled:
+                return False
+            for channel, target in list(self._targets.items()):
+                current = self.current_angles[channel]
+                error = target - current
+                config = self.servos[channel]
+                acceleration = config.max_speed_dps * 2.0
+                # Brake as the target approaches, retaining velocity on retarget.
+                desired_speed = math.copysign(
+                    min(config.max_speed_dps, math.sqrt(2 * acceleration * abs(error))),
+                    error,
+                )
+                velocity = self._velocities.get(channel, 0.0)
+                velocity += max(
+                    -acceleration * dt,
+                    min(acceleration * dt, desired_speed - velocity),
+                )
+                step = velocity * dt
+                if abs(error) < 1e-8 or (step * error > 0 and abs(step) >= abs(error)):
+                    angle = target
+                    self._targets.pop(channel)
+                    self._velocities.pop(channel, None)
+                else:
+                    angle = clamp_angle(config, current + step)
+                    self._velocities[channel] = velocity
+                self._write_angle(channel, angle)
+            return True
 
     def move_smooth(
         self, channel: int, target: float, duration: Optional[float] = None

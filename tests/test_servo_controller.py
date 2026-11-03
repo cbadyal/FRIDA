@@ -158,5 +158,81 @@ class SmootherMotionTests(unittest.TestCase):
             driver.assert_not_called()
 
 
+class ScheduledMotionTests(unittest.TestCase):
+    def make_controller(self):
+        bus = FakeBus()
+        controller = ServoController(driver=PCA9685(bus=bus))
+        return controller, bus
+
+    def test_scheduling_does_not_write_until_update_or_touch_other_channels(self):
+        controller, bus = self.make_controller()
+        self.assertTrue(controller.set_target(0, 160))
+        self.assertEqual(bus.block_writes, [])
+        for _ in range(200):
+            controller.update()
+        self.assertEqual(controller.current_angles[0], 160)
+        self.assertFalse(controller.is_moving(0))
+        self.assertTrue(bus.block_writes)
+        self.assertTrue(all(register == 0x06 for _, register, _ in bus.block_writes))
+
+    def test_head_and_arm_progress_together_and_head_uses_latest_target(self):
+        controller, _bus = self.make_controller()
+        controller.set_target(0, 180)
+        controller.set_target(2, 105)
+        for _ in range(50):
+            controller.update()
+        self.assertGreater(controller.current_angles[0], 150)
+        self.assertGreater(controller.current_angles[2], 60)
+        controller.set_target(0, 120)
+        for _ in range(400):
+            controller.update()
+        self.assertEqual(controller.current_angles[0], 120)
+        self.assertEqual(controller.current_angles[2], 105)
+
+    def test_speeds_and_ranges_hold_even_after_a_late_update(self):
+        controller, _bus = self.make_controller()
+        controller.set_target(0, 999)
+        previous = controller.current_angles[0]
+        for _ in range(300):
+            controller.update(elapsed=5)
+            current = controller.current_angles[0]
+            self.assertLessEqual(abs(current - previous), SERVOS[0].max_speed_dps / 50 + 1e-8)
+            self.assertLessEqual(current, 180)
+            previous = current
+        self.assertEqual(previous, 180)
+
+    def test_cancellation_prevents_scheduled_writes(self):
+        controller, bus = self.make_controller()
+        controller.set_target(0, 160)
+        controller.cancel()
+        self.assertFalse(controller.update())
+        self.assertFalse(controller.set_target(0, 170))
+        self.assertEqual(bus.block_writes, [])
+
+    def test_invalid_values_are_rejected_before_writing(self):
+        controller, bus = self.make_controller()
+        for value in (float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                controller.set_target(0, value)
+        for value in (0, -1, float("nan")):
+            with self.assertRaises(ValueError):
+                controller.update(value)
+        self.assertEqual(bus.block_writes, [])
+
+    def test_bus_is_closed_even_when_disabling_outputs_fails(self):
+        controller, bus = self.make_controller()
+        with patch.object(bus, "write_i2c_block_data", side_effect=OSError("I2C failure")):
+            with self.assertRaises(OSError):
+                controller.close()
+        self.assertTrue(bus.closed)
+
+    def test_bus_is_closed_when_initialization_fails(self):
+        bus = FakeBus()
+        with patch.object(bus, "write_byte_data", side_effect=OSError("I2C failure")):
+            with self.assertRaises(OSError):
+                PCA9685(bus=bus)
+        self.assertTrue(bus.closed)
+
+
 if __name__ == "__main__":
     unittest.main()

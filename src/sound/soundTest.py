@@ -9,17 +9,46 @@ Install: pip install pygame numpy --break-system-packages
 import pygame
 import numpy as np
 import random
-import time
+import threading
 
 # ── Audio Setup ───────────────────────────────────────────────────────────────
 
 SAMPLE_RATE = 44100
-pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1, buffer=512)
+_stopped = threading.Event()
+
+
+class PlaybackStopped(Exception):
+    """Raised to end an in-progress phrase when the demo shuts down."""
+
+
+def init_audio():
+    if pygame.mixer.get_init() is None:
+        pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1, buffer=512)
+    _stopped.clear()
+
+
+def stop_audio():
+    _stopped.set()
+    if pygame.mixer.get_init() is not None:
+        pygame.mixer.stop()
+
+
+def close_audio():
+    stop_audio()
+    pygame.mixer.quit()
+
+
+def _ensure_audio():
+    if _stopped.is_set():
+        raise PlaybackStopped()
+    if pygame.mixer.get_init() is None:
+        init_audio()
 
 # ── Sound Primitives ──────────────────────────────────────────────────────────
 
 def make_beep(freq=440, duration_ms=120, volume=0.6, wave_type="sine"):
     """Generate a single tone. wave_type: sine, square, sawtooth."""
+    _ensure_audio()
     n = int(SAMPLE_RATE * duration_ms / 1000)
     t = np.linspace(0, duration_ms / 1000, n, False)
 
@@ -41,6 +70,7 @@ def make_beep(freq=440, duration_ms=120, volume=0.6, wave_type="sine"):
 
 def make_sweep(freq_start, freq_end, duration_ms=200, volume=0.6):
     """Glide between two frequencies — gives that classic R2 warble."""
+    _ensure_audio()
     n = int(SAMPLE_RATE * duration_ms / 1000)
     t = np.linspace(0, duration_ms / 1000, n, False)
     freq  = np.linspace(freq_start, freq_end, n)
@@ -57,6 +87,7 @@ def make_sweep(freq_start, freq_end, duration_ms=200, volume=0.6):
 
 def make_warble(freq=800, rate=18, duration_ms=300, depth=0.3, volume=0.6):
     """Rapid frequency modulation — the wobbly excited R2 sound."""
+    _ensure_audio()
     n = int(SAMPLE_RATE * duration_ms / 1000)
     t = np.linspace(0, duration_ms / 1000, n, False)
     mod   = 1 + depth * np.sin(2 * np.pi * rate * t)
@@ -74,11 +105,13 @@ def make_warble(freq=800, rate=18, duration_ms=300, depth=0.3, volume=0.6):
 # ── Play Helpers ──────────────────────────────────────────────────────────────
 
 def play(sound, gap_ms=30):
+    _ensure_audio()
     sound.play()
-    pygame.time.wait(int(sound.get_length() * 1000) + gap_ms)
+    pause(sound.get_length() * 1000 + gap_ms)
 
 def pause(ms):
-    time.sleep(ms / 1000)
+    if _stopped.wait(ms / 1000):
+        raise PlaybackStopped()
 
 # ── Named Phrases ─────────────────────────────────────────────────────────────
 # Each function is a distinct "voice line" — mix and match alongside
@@ -149,7 +182,8 @@ def phrase_random():
 
 # ── Demo Sequence ─────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
+    init_audio()
     print("Robot chatter demo — Ctrl+C to stop\n")
 
     print("Startup...")
@@ -186,4 +220,12 @@ if __name__ == "__main__":
         pause(random.randint(200, 500))
 
     print("\nDone.")
-    pygame.mixer.quit()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        close_audio()

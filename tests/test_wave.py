@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from src.servo.controller import SERVOS, ServoController
-from src.servo.wave import RIGHT_ARM, main, wave
+from src.servo.wave import RIGHT_ARM, WaveGesture, main, wave
 
 
 class RecordingDriver:
@@ -63,6 +63,39 @@ class WaveTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     wave(controller, cycles=cycles)
                 self.assertEqual(driver.writes, [])
+
+    def test_scheduled_wave_returns_to_start_while_head_keeps_moving(self):
+        controller, driver = self.make_controller()
+        gesture = WaveGesture(controller, cycles=1)
+        self.assertTrue(gesture.start())
+        self.assertFalse(gesture.start())
+        controller.set_target(0, 170)
+        moved_together = False
+        for tick in range(1500):
+            gesture.update(tick / 50)
+            controller.update()
+            if controller.current_angles[0] > 150 and controller.current_angles[RIGHT_ARM] > 72:
+                moved_together = True
+            if not gesture.active:
+                break
+        self.assertFalse(gesture.active)
+        self.assertTrue(moved_together)
+        self.assertEqual(controller.current_angles[RIGHT_ARM], 72)
+        self.assertEqual(controller.current_angles[0], 170)
+        self.assertTrue(all(channel in (0, RIGHT_ARM) for channel, _ in driver.writes))
+
+    def test_scheduled_wave_stops_without_returning_after_cancellation(self):
+        controller, driver = self.make_controller()
+        gesture = WaveGesture(controller, cycles=1)
+        gesture.start()
+        controller.update()
+        controller.cancel()
+        writes = list(driver.writes)
+        gesture.update(1)
+        controller.update()
+        self.assertFalse(gesture.active)
+        self.assertEqual(driver.writes, writes)
+        self.assertNotEqual(controller.current_angles[RIGHT_ARM], 72)
 
     def test_cli_rejects_invalid_input_before_opening_hardware(self):
         for arguments in (
